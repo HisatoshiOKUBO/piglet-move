@@ -1484,18 +1484,138 @@ async function exportMonthlyCSV() {
   }
   if (!Array.isArray(batches) || !batches.length) { toast('対象データがありません', 'error'); return; }
 
+  // 各バッチの個体レコードを取得
+  for (const b of batches) {
+    if (b.records) continue; // ローカルはすでに records を持っている
+    if (USE_SUPABASE) {
+      try {
+        b.records = await sbGet('piglet_records', `batch_id=eq.${b.id}&order=seq_no.asc`);
+      } catch(e) {
+        b.records = [];
+      }
+    } else {
+      b.records = [];
+    }
+  }
+
+  // ヘルパー
+  const avg  = arr => arr.length ? (arr.reduce((a,c)=>a+c,0)/arr.length) : null;
+  const minV = arr => arr.length ? Math.min(...arr) : null;
+  const maxV = arr => arr.length ? Math.max(...arr) : null;
+  const fmt1 = v => v != null ? parseFloat(v.toFixed(1)) : '';
+  const fmt2 = v => v != null ? parseFloat(v.toFixed(2)) : '';
+  const gLabel = { '1':'雌', '2':'去勢', '3':'雄', 1:'雌', 2:'去勢', 3:'雄' };
+  const GENDER_ORDER = ['1','2','3'];
+
+  // 肥育舎かどうか判定（バッチのdestination を参照）
+  function isFikusha(destination) {
+    return (destination||'').includes('肥育');
+  }
+
+  // 1バッチ×1性別 の集計行を作成
+  function buildRows(b, gKey, recs, isFiku) {
+    const weights  = recs.map(r => parseFloat(r.weight)).filter(v => !isNaN(v) && v > 0);
+    const ageDays  = recs.map(r => parseInt(r.age_days)).filter(v => !isNaN(v) && v > 0);
+    const head     = recs.length;
+    const moveDate = b.movement_date || b.shipment_date || '';
+    const destName = b.destination  || b.slaughterhouse_name || '';
+    const gName    = gLabel[gKey] || gKey;
+
+    const avgW = avg(weights);
+    const avgA = avg(ageDays);
+    // ADG = 平均体重(kg) × 1000 / 平均日齢  ※単位 g/日
+    const adg  = (avgW != null && avgA != null && avgA > 0) ? (avgW * 1000) / avgA : null;
+
+    if (isFiku) {
+      // 肥育舎: 移動日,移動先,性別,頭数,最小日齢,最大日齢,平均日齢,最小体重,最大体重,平均体重,ADG
+      return [[
+        moveDate, destName, gName, head,
+        ageDays.length  ? minV(ageDays)  : '',
+        ageDays.length  ? maxV(ageDays)  : '',
+        ageDays.length  ? fmt1(avgA)     : '',
+        weights.length  ? fmt1(minV(weights)) : '',
+        weights.length  ? fmt1(maxV(weights)) : '',
+        weights.length  ? fmt1(avgW)     : '',
+        adg != null     ? fmt1(adg)      : '',
+      ]];
+    } else {
+      // 離乳舎・育成舎: 移動日,移動先,性別,頭数,平均日齢,平均体重,ADG
+      return [[
+        moveDate, destName, gName, head,
+        ageDays.length  ? fmt1(avgA)  : '',
+        weights.length  ? fmt1(avgW)  : '',
+        adg != null     ? fmt1(adg)   : '',
+      ]];
+    }
+  }
+
+  // ヘッダー行（移動先が混在する場合に備え、最も多い種別で判定 → 混在なら肥育舎優先）
+  const hasFiku    = batches.some(b => isFikusha(b.destination||b.slaughterhouse_name||''));
+  const hasNonFiku = batches.some(b => !isFikusha(b.destination||b.slaughterhouse_name||''));
+
   const destLabel = dest ? `　移動先：${dest}` : '';
   const BOM = '\uFEFF';
   const rows = [
     [`月間子豚移動集計表　${year}年${month}月${destLabel}`],
     [],
-    ['移動日','移動先','頭数','平均体重(kg)'],
   ];
-  batches.forEach(b => {
-    rows.push([b.movement_date||b.shipment_date||'', b.destination||b.slaughterhouse_name||'', b.total_count||0, b.avg_weight||'']);
-  });
-  const totalCount = batches.reduce((a,b)=>a+(parseInt(b.total_count)||0),0);
-  rows.push(['合計','',totalCount,'']);
+
+  // 移動先が混在するケースでは異なるヘッダーを持つブロックを分けて出力
+  if (hasFiku && hasNonFiku) {
+    // ── 離乳舎・育成舎ブロック ──
+    rows.push(['【離乳舎・育成舎】']);
+    rows.push(['移動日','移動先','性別','頭数','平均日齢','平均体重(kg)','ADG(g/日)']);
+    batches.filter(b => !isFikusha(b.destination||b.slaughterhouse_name||'')).forEach(b => {
+      const records = b.records || [];
+      GENDER_ORDER.forEach(gk => {
+        const recs = records.filter(r => String(r.gender) === gk && (r.weight || r.age_days));
+        if (!recs.length) return;
+        buildRows(b, gk, recs, false).forEach(r => rows.push(r));
+      });
+    });
+    rows.push([]);
+    // ── 肥育舎ブロック ──
+    rows.push(['【肥育舎】']);
+    rows.push(['移動日','移動先','性別','頭数','最小日齢','最大日齢','平均日齢','最小体重(kg)','最大体重(kg)','平均体重(kg)','ADG(g/日)']);
+    batches.filter(b => isFikusha(b.destination||b.slaughterhouse_name||'')).forEach(b => {
+      const records = b.records || [];
+      GENDER_ORDER.forEach(gk => {
+        const recs = records.filter(r => String(r.gender) === gk && (r.weight || r.age_days));
+        if (!recs.length) return;
+        buildRows(b, gk, recs, true).forEach(r => rows.push(r));
+      });
+    });
+  } else if (hasFiku) {
+    // 肥育舎のみ
+    rows.push(['移動日','移動先','性別','頭数','最小日齢','最大日齢','平均日齢','最小体重(kg)','最大体重(kg)','平均体重(kg)','ADG(g/日)']);
+    batches.forEach(b => {
+      const records = b.records || [];
+      GENDER_ORDER.forEach(gk => {
+        const recs = records.filter(r => String(r.gender) === gk && (r.weight || r.age_days));
+        if (!recs.length) return;
+        buildRows(b, gk, recs, true).forEach(r => rows.push(r));
+      });
+    });
+    // 合計行
+    const allRecs = batches.flatMap(b => b.records || []);
+    const totalHead = allRecs.length;
+    rows.push(['合計','','', totalHead,'','','','','','','']);
+  } else {
+    // 離乳舎・育成舎のみ
+    rows.push(['移動日','移動先','性別','頭数','平均日齢','平均体重(kg)','ADG(g/日)']);
+    batches.forEach(b => {
+      const records = b.records || [];
+      GENDER_ORDER.forEach(gk => {
+        const recs = records.filter(r => String(r.gender) === gk && (r.weight || r.age_days));
+        if (!recs.length) return;
+        buildRows(b, gk, recs, false).forEach(r => rows.push(r));
+      });
+    });
+    // 合計行
+    const allRecs = batches.flatMap(b => b.records || []);
+    const totalHead = allRecs.length;
+    rows.push(['合計','','', totalHead,'','','']);
+  }
 
   const csv = BOM + rows.map(row => row.map(v => {
     const s = String(v??'');
